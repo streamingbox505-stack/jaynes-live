@@ -1,17 +1,17 @@
-// JAYNES LIVE: WebSocket ingest -> ffmpeg -> HLS
+// JAYNES LIVE: HTTP chunk ingest -> ffmpeg -> HLS (no WebSocket)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { WebSocketServer } = require('ws');
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 const KEY = process.env.STREAM_KEY || '';
 const DIR = '/tmp/hls';
 fs.mkdirSync(DIR, { recursive: true });
 
-let current = null; // { ws, ff }
+let ff = null;
 let startedAt = 0;
+let lastChunk = 0;
 
 function clean() {
   for (const f of fs.readdirSync(DIR)) {
@@ -19,44 +19,12 @@ function clean() {
   }
 }
 
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-}
-
-const server = http.createServer((req, res) => {
-  cors(res);
-  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
-  const u = new URL(req.url, 'http://x');
-
-  if (u.pathname === '/' || u.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, live: !!current, since: startedAt }));
-  }
-
-  if (u.pathname.startsWith('/live/')) {
-    const name = path.basename(u.pathname);
-    const file = path.join(DIR, name);
-    fs.readFile(file, (err, data) => {
-      if (err) { res.writeHead(404); return res.end('not found'); }
-      const isM3u8 = name.endsWith('.m3u8');
-      res.writeHead(200, {
-        'Content-Type': isM3u8 ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
-        'Cache-Control': isM3u8 ? 'no-store' : 'public, max-age=60'
-      });
-      res.end(data);
-    });
-    return;
-  }
-  res.writeHead(404); res.end('not found');
-});
-
-function stopCurrent() {
-  if (!current) return;
-  try { current.ff.stdin.end(); } catch (e) {}
-  try { current.ff.kill('SIGTERM'); } catch (e) {}
-  try { current.ws.close(); } catch (e) {}
-  current = null;
+function stopFfmpeg() {
+  if (!ff) return;
+  try { ff.stdin.end(); } catch (e) {}
+  const p = ff;
+  setTimeout(() => { try { p.kill('SIGTERM'); } catch (e) {} }, 3000);
+  ff = null;
 }
 
 function startFfmpeg(mode) {
@@ -70,31 +38,79 @@ function startFfmpeg(mode) {
     '-hls_flags', 'delete_segments+independent_segments',
     '-hls_segment_filename', path.join(DIR, 'seg%05d.ts'),
     path.join(DIR, 'stream.m3u8')];
-  const ff = spawn('ffmpeg', [...input, ...video, ...audio, ...hls]);
-  ff.stderr.on('data', d => console.log('[ffmpeg]', d.toString().trim()));
-  ff.stdin.on('error', () => {});
-  return ff;
+  const p = spawn('ffmpeg', [...input, ...video, ...audio, ...hls]);
+  p.stderr.on('data', d => console.log('[ffmpeg]', d.toString().trim()));
+  p.stdin.on('error', () => {});
+  p.on('exit', code => { console.log('ffmpeg exit', code); if (ff === p) ff = null; });
+  return p;
 }
 
-const wss = new WebSocketServer({ server, path: '/ingest', maxPayload: 16 * 1024 * 1024 });
+// stop automatically if the studio disappears
+setInterval(() => {
+  if (ff && Date.now() - lastChunk > 20000) { console.log('no chunks, stopping'); stopFfmpeg(); }
+}, 5000);
 
-wss.on('connection', (ws, req) => {
+function send(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
+const server = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const u = new URL(req.url, 'http://x');
-  if (KEY && u.searchParams.get('key') !== KEY) { ws.close(1008, 'bad key'); return; }
-  const mode = u.searchParams.get('mode') === 'encode' ? 'encode' : 'copy';
 
-  stopCurrent();
-  clean();
-  const ff = startFfmpeg(mode);
-  current = { ws, ff };
-  startedAt = Date.now();
-  console.log('ingest started, mode =', mode);
+  if (u.pathname === '/' || u.pathname === '/health') {
+    return send(res, 200, { ok: true, live: !!ff, since: startedAt });
+  }
 
-  ws.on('message', data => { if (!ff.stdin.destroyed) ff.stdin.write(data); });
-  ws.on('close', () => { if (current && current.ws === ws) stopCurrent(); console.log('ingest closed'); });
-  ws.on('error', () => {});
-  ff.on('exit', code => console.log('ffmpeg exit', code));
+  if (u.pathname.startsWith('/live/')) {
+    const name = path.basename(u.pathname);
+    return fs.readFile(path.join(DIR, name), (err, data) => {
+      if (err) { res.writeHead(404); return res.end('not found'); }
+      const isM3u8 = name.endsWith('.m3u8');
+      res.writeHead(200, {
+        'Content-Type': isM3u8 ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
+        'Cache-Control': isM3u8 ? 'no-store' : 'public, max-age=60'
+      });
+      res.end(data);
+    });
+  }
+
+  if (req.method === 'POST' && u.pathname.startsWith('/ingest/')) {
+    if (KEY && u.searchParams.get('key') !== KEY) return send(res, 401, { error: 'bad key' });
+
+    if (u.pathname === '/ingest/start') {
+      stopFfmpeg();
+      clean();
+      ff = startFfmpeg(u.searchParams.get('mode') === 'encode' ? 'encode' : 'copy');
+      startedAt = Date.now();
+      lastChunk = Date.now();
+      return send(res, 200, { started: true });
+    }
+
+    if (u.pathname === '/ingest/chunk') {
+      if (!ff) return send(res, 409, { error: 'not started' });
+      lastChunk = Date.now();
+      const parts = [];
+      req.on('data', c => parts.push(c));
+      req.on('end', () => {
+        const buf = Buffer.concat(parts);
+        if (!ff || ff.stdin.destroyed) return send(res, 409, { error: 'stopped' });
+        ff.stdin.write(buf, () => send(res, 200, { ok: true, bytes: buf.length }));
+      });
+      return;
+    }
+
+    if (u.pathname === '/ingest/stop') {
+      stopFfmpeg();
+      return send(res, 200, { stopped: true });
+    }
+  }
+
+  res.writeHead(404); res.end('not found');
 });
 
 server.listen(PORT, () => console.log('JAYNES LIVE on port', PORT));
-                     
