@@ -12,6 +12,8 @@ fs.mkdirSync(DIR, { recursive: true });
 let ff = null;
 let startedAt = 0;
 let lastChunk = 0;
+let curMode = 'copy';
+const logs = [];
 
 function clean() {
   for (const f of fs.readdirSync(DIR)) {
@@ -34,12 +36,12 @@ function startFfmpeg(mode) {
        '-vf', 'scale=-2:480', '-b:v', '800k', '-g', '48', '-sc_threshold', '0']
     : ['-c:v', 'copy'];
   const audio = ['-c:a', 'aac', '-b:a', '96k', '-ar', '44100'];
-  const hls = ['-f', 'hls', '-hls_time', '4', '-hls_list_size', '5',
+  const hls = ['-f', 'hls', '-hls_time', '3', '-hls_list_size', '6',
     '-hls_flags', 'delete_segments+independent_segments',
     '-hls_segment_filename', path.join(DIR, 'seg%05d.ts'),
     path.join(DIR, 'stream.m3u8')];
   const p = spawn('ffmpeg', [...input, ...video, ...audio, ...hls]);
-  p.stderr.on('data', d => console.log('[ffmpeg]', d.toString().trim()));
+  p.stderr.on('data', d => { const t = d.toString().trim(); console.log('[ffmpeg]', t); logs.push(t); if (logs.length > 40) logs.shift(); });
   p.stdin.on('error', () => {});
   p.on('exit', code => { console.log('ffmpeg exit', code); if (ff === p) ff = null; });
   return p;
@@ -63,8 +65,13 @@ const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
 
   if (u.pathname === '/' || u.pathname === '/health') {
-    return send(res, 200, { ok: true, live: !!ff, since: startedAt });
+    let segs = 0; try { segs = fs.readdirSync(DIR).filter(f => f.endsWith('.ts')).length; } catch (e) {}
+    return send(res, 200, { ok: true, live: !!ff, since: startedAt, mode: curMode,
+      lastChunkAgo: ff ? Math.round((Date.now() - lastChunk) / 1000) : null,
+      playlist: fs.existsSync(path.join(DIR, 'stream.m3u8')), segments: segs });
   }
+
+  if (u.pathname === '/log') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(logs.join('\n')); }
 
   if (u.pathname.startsWith('/live/')) {
     const name = path.basename(u.pathname);
@@ -85,7 +92,9 @@ const server = http.createServer((req, res) => {
     if (u.pathname === '/ingest/start') {
       stopFfmpeg();
       clean();
-      ff = startFfmpeg(u.searchParams.get('mode') === 'encode' ? 'encode' : 'copy');
+      curMode = u.searchParams.get('mode') === 'encode' ? 'encode' : 'copy';
+      logs.length = 0;
+      ff = startFfmpeg(curMode);
       startedAt = Date.now();
       lastChunk = Date.now();
       return send(res, 200, { started: true });
@@ -114,3 +123,4 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => console.log('JAYNES LIVE on port', PORT));
+             
